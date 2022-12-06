@@ -1,0 +1,776 @@
+
+/*Section Program illustration*/
+
+/*Example of deming conference for rpsftm */
+
+proc import out=os_data_example
+            datafile="/usrfiles/bgcrh/biostat/songzil/2022 Deming Conference/RPSFTM_Example_Data.csv"
+			dbms=csv
+			replace;
+			getnames=YES;
+		run;
+
+%let fpidt = 1Jan2020;
+%let cutoffdt = 1Jan2024;
+
+/*Step 1: Post-process the data to align with ADaM Structure */
+data process;
+attrib USUBJID length=$200.;
+attrib TRT01 length=$200.;
+attrib TRT02 length=$200.;
+attrib TR01SDT format=date9.;
+attrib TR02SDT format=date9.;
+attrib ADT format=date9.;
+attrib AVAL format= best12.;
+attrib CNSR format=best12.;
+attrib PDDT format=date9.;
+attrib ACUTDT format=date9.;
+attrib RANDDT format=date9.;
+
+set os_data_example;
+
+USUBJID= cat('example', '-',id);
+if trt=0 then TRT01='control';
+else if trt=1 then TRT01='active';
+
+if swtrt=1 then TRT02='active';
+else TRT02 = '';
+
+TR01SDT = "&fpidt"d + enterT*30.4375 -1;
+
+if TRT02 ne '' then TR02SDT = tr01sdt + TTPdy*30.4375 -1;
+else TR02SDT = .;
+
+ADT = tr01sdt + OSdy*30.4375-1;
+ACUTDT = tr01sdt + CNSdy*30.4375 -1;
+
+AVAL= (adt-tr01sdt)/30.4375;
+CNSR=OScnsr;
+
+RANDDT = TR01SDT;
+
+ADY= (ADT-RANDDT+1)/30.4375;
+
+if TTPcnsr = 0 then PDDT = tr01sdt + TTPdy*30.4375 -1;
+run;
+
+/*Step 2: Implement RPSFTM*/
+
+/*Step 2.1: Generate the an OS data for each value of PSI*/
+data pre_RPSFTM_data;
+attrib T_ON     length=8;
+attrib T_OFF    length=8;
+attrib PSI      length=8;
+attrib T_PSI    length=8;
+attrib CNS      length=8;
+attrib ADY_PSI  length=8;
+attrib ADY_PSI_nr  length=8;
+attrib CNSR_PSI    length=8;
+attrib CNSR_PSI_nr length=8;
+attrib CNS_PSI  length=8;
+attrib TRTN     length=8;
+attrib SWTRTN   length=8;
+set process;
+
+if trt01 = "active" then TRTN=1;
+else if trt01 = "control" then TRTN=0;
+
+if trt02 = "active" then SWTRTN=1;
+else SWTRTN=0;
+
+do psi = -1 to 1 by 0.01;   /*need to find the range which cover the true value of shrink factor psi*/
+
+
+  CNS = (ACUTDT - RANDDT + 1)/30.4375; /*censoring time of without re-censoring */  
+  CNS_PSI = min(CNS*exp(PSI), CNS);    /*censoring time of re-censoring */  
+
+  if TRTN = 1 then do;
+     T_ON = (ADT - RANDDT + 1)/30.4375;
+     T_OFF = 0;
+     T_PSI = T_OFF + T_ON*exp(PSI);
+  end;
+  else if TRTN=0 and SWTRTN = 1 then do;
+     T_ON = (ADT - TR02SDT + 1)/30.4375;
+     T_OFF = (TR02SDT - RANDDT)/30.4375;
+     T_PSI = T_OFF + T_ON*exp(PSI);
+  end;
+  else if TRTN=0 and SWTRTN = 0 then do;
+     T_ON = 0;
+     T_OFF = (ADT - RANDDT + 1)/30.4375;
+     T_PSI = T_OFF + T_ON*exp(PSI);
+  end;
+
+/* apply to both treatment arm and control arm */
+/* with re-censoring: drive shinked ADY_PSI and CNSR_PSI*/
+       if CNSR = 0 then do ;
+          if T_PSI > CNS_PSI then do;
+             ADY_PSI = CNS_PSI;
+             CNSR_PSI = 1;
+          end;
+          else if T_PSI <= CNS_PSI then do;
+             ADY_PSI = T_PSI;
+             CNSR_PSI = 0;
+          end;
+       end;
+       else if CNSR >= 1 then do;
+            CNSR_PSI = 1;
+            ADY_PSI = CNS_PSI;
+       end;
+
+/* without re-censoring: drive shinked ADY_PSI_nr and CNSR_PSI_nr*/
+
+      ADY_PSI_nr = T_PSI;
+      CNSR_PSI_nr = CNSR;
+  output;
+end;
+run;
+
+proc sort data=pre_RPSFTM_data; by PSI USUBJID;run;
+
+/*Step 2.2: Use grid method to find value of PSI which maximize the p-value from logrank test*/
+
+/* with re-censoring*/
+ods select none;
+ods output HomTests=P_value ;
+proc lifetest data=pre_RPSFTM_data;
+by PSI;
+time ADY_PSI*CNSR_PSI(1);
+strata trt01/test=logrank;
+run;
+ods select all;
+
+proc sort data=p_value out=PSI_EST; by probchisq psi;run;
+
+data psi_est;
+set psi_est end=eof;
+if eof then output;
+run;
+
+/*create the macro variable for needed value*/
+
+proc sql noprint;
+ select psi into: psi_est from PSI_EST;
+quit;
+
+
+/*without re-censoring*/
+ods select none;
+ods output HomTests=P_value_nr ;
+proc lifetest data=pre_RPSFTM_data;
+by PSI;
+time ADY_PSI_nr*CNSR_PSI_nr(1);
+strata trt01/test=logrank;
+run;
+ods select all;
+
+proc sort data=p_value_nr out=PSI_EST_nr; by probchisq psi;run;
+
+data psi_est_nr;
+set psi_est_nr end=eof;
+if eof then output;
+run;
+
+/*create the macro variable for needed value*/
+
+proc sql noprint;
+ select psi into: psi_est_nr from PSI_EST_nr;
+quit;
+
+/*Step 2.3: Construct counterfactual OS */
+
+data RPSFTM_OS;
+attrib T_ON         length=8;
+attrib T_OFF        length=8;
+attrib PSI          length=8;
+attrib PSI_nr       length=8;
+attrib T_PSI        length=8;
+attrib T_PSI_nr     length=8;
+attrib CNS          length=8;
+attrib ADY_PSI      length=8;
+attrib ADY_PSI_nr   length=8;
+attrib CNSR_PSI     length=8;
+attrib CNSR_PSI_nr  length=8;
+attrib CNS_PSI      length=8;
+set process;
+
+PSI= &psi_est;
+PSI_nr = &psi_est_nr;
+
+if trt01 = "active" then TRTN=1;
+else if trt01 = "control" then TRTN=0;
+
+if trt02 = "active" then SWTRTN=1;
+else SWTRTN=0;
+
+CNS = (ACUTDT - RANDDT + 1)/30.4375;
+CNS_PSI = min(CNS*exp(PSI), CNS);
+
+if TRTN = 1 then do ;
+ T_ON = (ADT - RANDDT + 1)/30.4375;
+ T_OFF = 0;
+ T_PSI = T_OFF + T_ON;
+ T_PSI_nr = T_OFF + T_ON;
+end;
+
+else if TRTN=0 and SWTRTN = 1 then do;
+ T_ON = (ADT - TR02SDT + 1)/30.4375;
+ T_OFF = (TR02SDT - RANDDT)/30.4375;
+ T_PSI = T_OFF + T_ON*exp(PSI);
+ T_PSI_nr = T_OFF + T_ON*exp(PSI_nr);
+end;
+
+else if TRTN=0 and SWTRTN = 0 then do;
+ T_ON = 0;
+ T_OFF = (ADT - RANDDT + 1)/30.4375;
+ T_PSI = T_OFF + T_ON;
+ T_PSI_nr = T_OFF + T_ON;
+end;
+
+/* only applied to patient in control with crossover*/
+/* with re-censoring: drive shinked ADY_PSI and CNSR_PSI*/
+
+if trtn=0 and swtrtn=1 then do;
+       if CNSR = 0 then do ;
+          if T_PSI > CNS_PSI then do;
+             ADY_PSI = CNS_PSI;
+             CNSR_PSI = 1;
+          end;
+          else if T_PSI <= CNS_PSI then do;
+             ADY_PSI = T_PSI;
+             CNSR_PSI = 0;
+          end;
+       end;
+       else if CNSR >= 1 then do;
+            CNSR_PSI = 1;
+            ADY_PSI = CNS_PSI;
+       end;
+
+/* without re-censoring: drive shinked ADY_PSI_nr and CNSR_PSI_nr*/
+
+      ADY_PSI_nr = T_PSI_nr;
+      CNSR_PSI_nr = CNSR;
+end;
+
+if trtn=1 then do;
+CNSR_PSI=CNSR;
+ADY_PSI=T_OFF + T_ON;
+
+CNSR_PSI_nr=CNSR;
+ADY_PSI_nr=T_OFF + T_ON;
+end;
+
+if trtn=0 and swtrtn=0 then do;
+CNSR_PSI=CNSR;
+ADY_PSI=T_OFF + T_ON;
+
+CNSR_PSI_nr=CNSR;
+ADY_PSI_nr=T_OFF + T_ON;
+end;
+
+run;
+
+/*Step 3: Output RPSFTM result*/
+
+/*with re-censoring*/
+proc lifetest data=RPSFTM_OS ;
+time ADY_PSI*CNSR_PSI(1);
+strata trt01/test=logrank;
+ods output HomTests=RPSFTM_LogRank;
+run;
+
+/*the 95% CI of adjusted HR should come from bootstrap*/
+proc phreg data=RPSFTM_OS;
+class trt01;
+model ADY_PSI*CNSR_PSI(1)=trt01 /ties= efron rl;
+ods output ParameterEstimates=RPSFTM_Cox;
+run;
+
+/*without re-censoring*/
+proc lifetest data=RPSFTM_OS ;
+time ADY_PSI_nr*CNSR_PSI_nr(1);
+strata trt01/test=logrank;
+ods output HomTests=RPSFTM_LogRank_nr;
+run;
+
+/*the 95% CI of adjusted HR should come from bootstrap*/
+proc phreg data=RPSFTM_OS;
+class trt01;
+model ADY_PSI_nr*CNSR_PSI_nr(1)=trt01 /ties= efron rl;
+ods output ParameterEstimates=RPSFTM_Cox_nr;
+run;
+
+data combine;
+attrib Model length=$200.;
+set RPSFTM_Cox (in=a) RPSFTM_Cox_nr(in=b);
+if a then do;
+   Model='RPSFTM';
+   PSI = &psi_est;
+end;
+if b then do;
+   Model='RPSFTMnr';
+   PSI = &psi_est_nr;
+end;
+keep model estimate chisq HazardRatio PSI;
+run;
+
+/***************************************************************************************************/
+/*example of deming conference for two stage */
+
+proc import out=os_data_example
+            datafile="/usrfiles/bgcrh/biostat/songzil/2022 Deming Conference/TS_Example_Data.csv"
+			dbms=csv
+			replace;
+			getnames=YES;
+		run;
+
+%let fpidt = 1Jan2020;
+%let cutoffdt = 1Jan2024;
+
+/*Step 1: Post-process the data to align with ADaM Structure */
+data process;
+attrib USUBJID length=$200.;
+attrib TRT01 length=$200.;
+attrib TRT02 length=$200.;
+attrib TR01SDT format=date9.;
+attrib TR02SDT format=date9.;
+attrib ADT format=date9.;
+attrib AVAL format= best12.;
+attrib CNSR format=best12.;
+attrib PDDT format=date9.;
+attrib COV format=best12.;
+attrib ECOG format=best12.;
+attrib ACUTDT format=date9.;
+attrib RANDDT format=date9.;
+
+set os_data_example;
+
+USUBJID= cat('example', '-',id);
+if trt=0 then TRT01='control';
+else if trt=1 then TRT01='active';
+
+if swtrt=1 then TRT02='active';
+else TRT02 = '';
+
+TR01SDT = "&fpidt"d + enterT*30.4375 -1;
+
+if TRT02 ne '' then TR02SDT = tr01sdt + TTPdy*30.4375 -1;
+else TR02SDT = .;
+
+ADT = tr01sdt + OSdy*30.4375-1;
+ACUTDT = tr01sdt + CNSdy*30.4375 -1;
+ECOG = strata;
+
+AVAL= (adt-tr01sdt)/30.4375;
+CNSR=OScnsr;
+
+RANDDT = TR01SDT;
+
+ADY= (ADT-RANDDT+1)/30.4375;
+
+if TTPcnsr = 0 then PDDT = tr01sdt + TTPdy*30.4375 -1;
+run;
+
+proc format;
+value bmtfmt 0 = 'NS' 1 = 'S' ;
+run;
+
+/*Step 2: Two-Stage Model*/
+
+/*Step 2.1: Prepare dataset for AFT model*/
+data OS_Control;
+attrib TRTN label='ARM Numerical Code' length=8;
+attrib SWTRTN label='Cross Over Indication' length=8;
+set process;
+
+if trt01= "active" then TRTN=1;
+else if trt01="control" then TRTN=0;
+
+if PDDT ne .  then PPS= adt- PDDT + 1;
+else if PDDT eq . then PPS= .;
+
+if tr02sdt ne . then SWTRTN=1;
+else if tr02sdt eq . then  SWTRTN=0;
+
+if PPS ne . then pdflg=1;
+if TRTN=0  and PPS ne . then output;
+run;
+
+/*Step 2.2: Apply AFT to get shrink factor*/
+proc lifereg data=OS_Control order=internal;
+class SWTRTN ECOG;
+model PPS*CNSR(1)= SWTRTN COV ECOG;
+ods output ParameterEstimates=TS_EFFECT_C;
+format swtrtn bmtfmt.;
+run;
+
+data TS_EFFECT_C_temp;  
+set TS_EFFECT_C;
+where parameter='SWTRTN' and level1='NS'; /*check the result from AFT model to select the correct level for shrink factor*/
+keep Estimate LowerCL UpperCL;
+run;
+
+proc sql noprint;
+ select Estimate into: TS_PSI_C from TS_EFFECT_C_temp;
+quit;
+
+/*Step 2.3: Construct counterfactual OS */
+
+data TS_OS;
+set process;
+attrib T_ON   length=8;
+attrib T_OFF  length=8;
+attrib PSI    length=8;
+attrib T_TS   length=8;
+
+attrib ADY_TS  length=8;
+attrib CNSR_TS length=8;
+
+attrib ADY_TS_nr  length=8;
+attrib CNSR_TS_nr length=8;
+
+if trt01= "active" then TRTN=1;
+else if trt01= "control" then TRTN=0;
+
+if tr02sdt ne . and trtn = 0 then SWTRTN=1;
+else SWTRTN=0;
+
+PSI = round(exp(&TS_PSI_C), 0.00001);
+
+CNS_PSI = min(CNS*PSI, CNS); /*censoring time of without recensoring */  
+CNS = (ACUTDT - RANDDT + 1)/30.4375;  /*censoring time of recensoring */  
+
+/* only applied to patient in control with crossover*/
+/* with recensoring: drive shinked TS_PSI and CNSR_TS*/
+
+    if trtn=0 and swtrtn = 1 then do;
+      if PDDT ne . then ADY_SWTRT= (ADT-PDDT+1)/30.4375;
+      else if PDDT eq . and tr02sdt ne . then ADY_SWTRT= (ADT-tr02sdt +1)/30.4375;
+    end;
+
+    else ADY_SWTRT=0;
+
+    T_ON = ADY*TRTN +(1-TRTN)*SWTRTN*ADY_SWTRT;
+    T_OFF = (1-TRTN)*SWTRTN*(ADY-ADY_SWTRT)+(1-TRTN)*(1-SWTRTN)*ADY;
+    T_TS = T_OFF + T_ON*PSI;
+
+    if trtn=0 and swtrtn=1 then do;
+         if CNSR = 0 then do ;
+           if T_TS > CNS_PSI then do;
+             ADY_TS = CNS_PSI;
+             CNSR_TS = 1;
+           end;
+           else if T_TS <= CNS_PSI then do;
+             ADY_TS = T_TS;
+             CNSR_TS = 0;
+           end;
+         end;
+
+         if CNSR >= 1 then do;
+           CNSR_TS = 1;
+           ADY_TS= CNS_PSI;
+         end;
+
+   /* without recensoring: drive shinked ADY_TS_nr and CNSR_TS_nr*/
+
+         CNSR_TS_nr = CNSR;
+         ADY_TS_nr = T_TS;
+   end;
+
+   if trtn=1 then do;
+     CNSR_TS = CNSR;
+     ADY_TS = T_OFF + T_ON;
+
+     CNSR_TS_nr = CNSR;
+     ADY_TS_nr = T_OFF + T_ON;
+   end;
+
+   if trtn=0 and swtrtn=0 then do;
+     CNSR_TS = CNSR;
+     ADY_TS = T_OFF + T_ON;
+
+	 CNSR_TS_nr = CNSR;
+     ADY_TS_nr = T_OFF + T_ON;
+   end;
+
+run;
+
+/*Step 3: Output TS result*/
+
+/*TS with recensoring*/
+/*the 95% CI of adjusted HR should come from bootstrap*/
+proc phreg data=TS_OS;
+class trt01;
+model ADY_TS*CNSR_TS(1)= trt01 /ties=efron rl;
+ods output ParameterEstimates=TS_Cox;
+run;
+
+/*TS without recensoring*/
+/*the 95% CI of adjusted HR should come from bootstrap*/
+proc phreg data=TS_OS;
+class trt01;
+model ADY_TS_nr*CNSR_TS_nr(1)= trt01 /ties=efron rl;
+ods output ParameterEstimates=TS_Cox_nr;
+run;
+
+/*****************************************************************/
+/*example of deming conference for IPCW */
+
+options validvarname=v7;
+
+libname adam "//usrfiles/bgcrh/biostat/songzil/2022 Deming Conference" inencoding=any outencoding=any;
+
+data shilong2;
+    set adam.shilong;
+    by id;
+    if dco ^= . then do;
+        if tstart < dco;
+    end;
+run;
+
+data shilong2;
+    set shilong2;
+    by id;
+    if dco ^= . and last.id then do;
+        if tstop > dco then do;
+            event = 0;
+            tstop = dco;
+        end;
+    end;
+run;
+
+data shilong2;
+    set shilong2;
+    by id;
+    if last.id then cens = 1 - event;
+    else cens = 0;
+	if last.id and dco ^= . and ady > dco then cross = 1;
+	else cross = 0;
+run;
+
+* replicate event times within each subject;
+proc sort data=shilong2 out=replic_times(keep=tstop) nodupkey;
+	by tstop;
+	where event = 1;
+run;
+
+data _null_;
+	set replic_times end=eof;
+	format t $2000.;
+	retain t;
+	if _N_=1 then t = strip(put(tstop, best12.));
+	else t = strip(t) || " " || strip(put(tstop, best12.));
+	if eof then do;
+		call symput("n", strip(put(_N_,12.0)));
+		call symput("t", t);
+	end;
+run;
+
+
+data df;
+	set shilong2;
+	array t{&n} _temporary_ (&t);
+
+	count = 0;
+	do i=1 to &n;
+		if t[i] > tstart and t[i] < tstop then do;
+			count = count + 1;
+			if count = 1 then do;
+				t1 = tstart; t2 = t[i]; output;
+			end;
+			else do;
+				t1 = t2; t2 = t[i]; output;
+			end;
+		end;
+		else if count >= 1 then do;
+			t1 = t2; t2 = tstop; output; 
+			leave;
+		end;
+	end;
+	if count = 0 then do;
+		t1 = tstart; t2 = tstop; output;
+	end; 
+	else if t2 < tstop then do; * last event time < tstop;
+		t1 = t2; t2 = tstop; output;
+	end;
+run;
+
+data df;
+	set df(drop = tstart tstop count i);
+	by id;
+	if not last.id then do;
+		event = 0; cens = 0; cross = 0;
+	end;
+	rename t1 = tstart t2 = tstop;
+run;
+
+
+proc sort data=df;
+    by bras_f;
+run;
+
+
+* Denominator model for censoring with time-dependent covariates 
+    The survival estimate from SAS is wrong in this case
+    Need to manually obtain the survival estimate;
+
+proc phreg data=df;
+    by bras_f;
+    class sex_f pathway_f;
+    model (tstart, tstop)*cross(0) = agerand sex_f tt_Lnum 
+        rmh_alea_c pathway_f ps ttc tran / ties = efron;
+    output out = df_den survival = surv / method = FH ;
+    ods output ParameterEstimates=den1;
+    baseline out = basehaz 
+             cumhaz = cumhaz0 / method = FH;
+run;
+ods output close;
+
+data den1b;
+    set den1;
+    format paramid $30.;
+    if classval0 = "" then paramid = strip(parameter);
+    else paramid = strip(parameter) || "_" || strip(classval0);
+run;
+
+proc transpose data=den1b out=den1t prefix=b_;
+    by bras_f;
+    var estimate;
+    id paramid;
+run;
+
+* obtain baseline hazard estimates at event time points;
+data basehaz2;
+    set basehaz;
+    by bras_f;
+    haz0 = dif(cumhaz0);
+    if first.bras_f then delete;
+run;
+
+* use the following two conditions to subset data: 
+	(1) censoring event time from model fit <= time of interest 
+	(2) the time interval for time-dependent covariates that 
+		covers the censoring event time;
+proc sql noprint;
+    create table w_den_df1 as
+    select a.bras_f, a.id, a.tstart, a.tstop, 
+        c.tstop as time, c.haz0, 
+        d.tstart as tstart2, d.tstop as tstop2, 
+        b.b_agerand * d.agerand + 
+        b.b_sex_f_Female * (d.sex_f = "Female") + 
+        b.b_tt_Lnum * d.tt_Lnum + 
+        b.b_rmh_alea_c * d.rmh_alea_c + 
+        b.b_pathway_f_HR * (d.pathway_f = "HR") +
+        b.b_pathway_f_MAP_Kinase * (d.pathway_f = "MAP Kinase") +  
+        b.b_ps * d.ps + 
+        b.b_ttc * d.ttc + 
+        b.b_tran * d.tran as eta
+    from df as a, den1t as b, basehaz2 as c, df as d
+    where a.bras_f = b.bras_f and 
+    a.bras_f = c.bras_f and c.tstop <= a.tstop and 
+    a.bras_f = d.bras_f and a.id = d.id and 
+	d.tstart < c.tstop and d.tstop >= c.tstop
+    order by bras_f, id, tstart, tstop, time;
+run;
+
+* cumulate hazards at censoring times up to time of interest;
+data w_den_df2;
+    set w_den_df1;
+    by bras_f id tstart tstop;
+    haz = haz0*exp(eta);
+    retain cumhaz;
+    if first.tstart then cumhaz = 0;
+    cumhaz + haz;
+    if last.tstart then do;
+        surv = exp(-cumhaz);
+        output;
+    end;
+/*    drop haz0 eta haz cumhaz;*/
+run;
+
+* fill in cases when no events occur before time of interest;
+data w_den;
+    merge df(in=a) w_den_df2(in=b drop=time tstart2 tstop2);
+    by bras_f id tstart tstop;
+    if a;
+    if surv = . then surv = 1;
+run;
+
+
+* Numerator model for censoring, no time-dependent covariates;
+proc phreg data=df;
+    by bras_f;
+    class sex_f pathway_f;
+    model (tstart, tstop)*cross(0) = agerand sex_f tt_Lnum 
+        rmh_alea_c pathway_f / ties = efron;
+    output out = w_num survival = surv / method = FH ;
+run;
+ods output close;
+
+
+* Numerator model for censoring ignoring baseline covariates;
+proc phreg data=df;
+    by bras_f;
+    model (tstart, tstop)*cross(0) = / ties = efron;
+    output out = w_num2 survival = surv / method = FH ;
+run;
+ods output close;
+
+
+* merge survival estimates from different models;
+data dfs;
+    merge w_den(rename=(surv=surv_den)) 
+        w_num(rename=(surv=surv_num)) 
+        w_num2(rename=(surv=surv_num2));
+    by bras_f id tstart tstop;
+    * nonstabilized weights;
+    w = 1/surv_den;
+    * stabilized weights considering baseline covariates;
+    sw = surv_num/surv_den;
+    * stabilized weights ignoring baseline covariates;
+    sw2 = surv_num2/surv_den;
+run;
+
+
+* fit Cox regression with stabilized weights considering 
+    baseline covariates;
+proc phreg data=dfs covsandwich;
+    class bras_f(ref="CT") sex_f pathway_f;
+    model (tstart, tstop)*event(0) = bras_f agerand sex_f tt_Lnum 
+        rmh_alea_c pathway_f / ties = efron risklimits ;
+	id id;
+    weight sw;
+run;
+
+
+* IPCW log-rank test with stablized weights ignoring
+    baseline covariates;
+proc phreg data=dfs covsandwich;
+    class bras_f(ref="CT");
+    model (tstart, tstop)*event(0) = bras_f / 
+		ties = efron risklimits ;
+	id id;
+    weight sw2;
+run;
+
+
+* IPCW KM estimates, cannot be obtained from proc lifetest;
+proc phreg data=dfs covsandwich;
+    by bras_f;
+    model (tstart, tstop)*event(0) = / ties = efron;
+	id id;
+	weight sw2;
+    output out = km survival = surv / method = FH ;
+run;
+ods output close;
+
+proc sort data=km out=km_df(keep=bras_f tstop surv) nodupkey;
+	by bras_f tstop surv;
+run;
+
+proc sgplot data=km_df;
+	step x=tstop y=surv / group=bras_f;
+run;
+
+
+
+

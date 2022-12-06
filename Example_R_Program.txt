@@ -1,0 +1,555 @@
+# Section Program illustration
+
+# load R package 
+
+library(mvtnorm)
+library(Matrix)
+library(dplyr)
+library(haven)
+library(survival)
+library(readxl)
+library(gsDesign)
+library(nphsim)
+library(ggpubr)
+library(data.table)
+library(MASS)
+library(Hmisc)
+library(ggplot2)
+library(survival)
+library(officer)
+library(rvg)
+library(ipcwswitch)
+
+# Example of deming conference for rpsftm 
+
+os_data_itt<-read.csv("/mnt/usrfiles/bgcrh/biostat/songzil/2022 Deming Conference/RPSFTM_Example_Data.csv")
+
+nphAlltest3 <-       # log-rank only
+  function (survival, cnsr, trt) 
+  {
+    fit <- survfit(Surv(survival, 1-cnsr) ~ trt)
+    lr <- unlist(test.lr(survival, cnsr, trt))
+    lr.ci <- exp(c(log(lr[3]) - qnorm(0.975) * lr[4], log(lr[3]) + 
+                     qnorm(0.975) * lr[4]))
+    stat1 <- data.frame(Test = "Log-Rank", t(c(lr[c(1, 3)], lr.ci)), t(summary(fit)$table[,7]))
+    return(stat1)
+  }
+
+rpsftmfit<-function(data,
+                    low,
+                    high,
+                    sep){
+  #set up the parameter for rpsftm
+  nR<-nrow(data)
+  nC<-ncol(data)
+  psi<-seq(low,high,sep)
+  psi1<-matrix(0,length(psi),1)
+  psi1_nr<-matrix(0,length(psi),1)
+  chi<-matrix(0,length(psi),1)
+  chi_nr<-matrix(0,length(psi),1)
+  pvalue<-matrix(0,length(psi),1)
+  pvalue_nr<-matrix(0,length(psi),1)
+  alpha<-0.05
+  
+  #use grid method to output the log rank test p-value for all psi values
+  for (i in 1:length(psi)){
+    rpsftm_temp<- data%>%mutate(t_on= OSdy*trt + (1-trt)*swtrt*(OSdy-swtrtdy),     #observed time of active 
+                                t_off=(1-trt)*swtrt*swtrtdy + (1-trt)*(1-swtrt)*OSdy,  #observed time of control
+                                T= t_on+t_off, 
+                                U= t_off + exp(psi[i])*t_on,   # counterfactual time with shrink effect psi
+                                temp_CNSdy=CNSdy*exp(psi[i]), # independent censoring time for active group and control group (with switch)
+                                cut_U= ifelse(CNSdy<=temp_CNSdy,CNSdy,temp_CNSdy),  # censoring time for re-censoring
+                                #with re-censoring
+                                psi_OSdy= (1-OScnsr)*ifelse(U<=cut_U,U,cut_U) + OScnsr*cut_U, # recal the event time up to cut_U 
+                                psi_cnsr= (1-OScnsr)*ifelse(U<=cut_U,0,1) + OScnsr,  # recal the censor  indicator 
+                                #without re-censoring
+                                psi_OSdy_nr = U,
+                                psi_cnsr_nr = OScnsr)%>%
+      
+      dplyr::select(enterT,treatment,trt,swtrt,psi_cnsr,psi_OSdy,psi_OSdy_nr, psi_cnsr_nr, t_on,t_off,T,U,cut_U,CNSdy, temp_CNSdy, swtrtdy, OSdy, OScnsr)
+    
+    pvalue[i,1]<- 1-pchisq(survdiff(Surv(psi_OSdy,1-psi_cnsr) ~ treatment, data = rpsftm_temp)$chisq,1) #log-rank test p-value  for re-censoring
+    pvalue_nr[i,1]<- 1-pchisq(survdiff(Surv(psi_OSdy_nr,1-psi_cnsr_nr) ~ treatment, data = rpsftm_temp)$chisq,1) #log-rank test p-value  for re-censoring
+    psi1[i,1]=psi[i]
+    psi1_nr[i,1]=psi[i]
+    chi[i,1] <- survdiff(Surv(psi_OSdy,1-psi_cnsr) ~ treatment, data = rpsftm_temp)$chisq
+    chi_nr[i,1] <- survdiff(Surv(psi_OSdy_nr,1-psi_cnsr_nr) ~ treatment, data = rpsftm_temp)$chisq
+  }  
+  
+  # find the shrink effect by using grid method (psi which maximize the p-value (no treatment effect)) re-censoring
+  rpsft_temp<-data.frame(cbind(psi1,pvalue))%>%arrange(desc(X2))
+  colnames(rpsft_temp)<-c('psi','pvalue')
+  rpsft_result<-rpsft_temp%>%slice(row_number=1)%>%mutate(psi_hat=psi,
+                                                          hr_hat=exp(psi_hat),
+                                                          se=abs(psi_hat)/qnorm(1-pvalue/2,0,1),
+                                                          L=exp(psi_hat-qnorm(1-alpha/2,0,1)*se),
+                                                          U=exp(psi_hat+qnorm(1-alpha/2,0,1)*se))
+  
+  # find the shrink effect by using grid method (psi which maximize the p-value (no treatment effect)) without re-censoring
+  rpsft_temp_nr<-data.frame(cbind(psi1_nr,pvalue_nr))%>%arrange(desc(X2))
+  colnames(rpsft_temp_nr)<-c('psi','pvalue')
+  rpsft_result_nr<-rpsft_temp_nr%>%slice(row_number=1)%>%mutate(psi_hat=psi,
+                                                                hr_hat=exp(psi_hat),
+                                                                se=abs(psi_hat)/qnorm(1-pvalue/2,0,1),
+                                                                L=exp(psi_hat-qnorm(1-alpha/2,0,1)*se),
+                                                                U=exp(psi_hat+qnorm(1-alpha/2,0,1)*se))
+  
+  PSI_hat=rpsft_result[1,1]  #shrink effect with re-censoring
+  PSI_hat_nr=rpsft_result_nr[1,1]  #shrink effect without re-censoring
+  
+  #perform rpsftm analysis by remove the subsequent effect (with or without recensoring)
+  final<- data%>%mutate(t_on= OSdy*trt + (1-trt)*swtrt*(OSdy-swtrtdy),  #observed time of active 
+                        t_off=(1-trt)*swtrt*swtrtdy + (1-trt)*(1-swtrt)*OSdy, #observed time of control
+                        T=t_on+t_off,
+                        U=t_off + exp(PSI_hat)*t_on,  # counterfactual time assume no treatment effect with shrink factor PSI_hat with re-censoring
+                        U_nr= t_off + exp(PSI_hat_nr)*t_on,  # counterfactual time assume no treatment effect with shrink factor PSI_hat without re-censoring
+                        temp_CNSdy=CNSdy*exp(PSI_hat), 
+                        cut_U= ifelse(CNSdy<=temp_CNSdy,CNSdy,temp_CNSdy),
+                        #with re-censroing
+                        psi_cnsr=(1-OScnsr)*ifelse(U<=cut_U,0,1)+OScnsr,
+                        psi_OSdy=(1-OScnsr)*ifelse(psi_cnsr==0,U,cut_U)+ OScnsr*cut_U,
+                        RPSFTM_cnsr=(1-trt)*swtrt*psi_cnsr + (1-trt)*(1-swtrt)*OScnsr + trt*OScnsr, 
+                        RPSFTM_OSdy=(1-trt)*swtrt*psi_OSdy + (1-trt)*(1-swtrt)*OSdy + trt*OSdy,
+                        #without re-censoring
+                        psi_cnsr_n= OScnsr,
+                        psi_OSdy_n= U_nr,
+                        RPSFTMn_cnsr=(1-trt)*swtrt*psi_cnsr_n + (1-trt)*(1-swtrt)*OScnsr + trt*OScnsr,
+                        RPSFTMn_OSdy=(1-trt)*swtrt*psi_OSdy_n + (1-trt)*(1-swtrt)*OSdy + trt*OSdy)%>%
+    dplyr::select(enterT,treatment,trt,swtrt,psi_cnsr,psi_OSdy, psi_cnsr_n,psi_OSdy_n, t_on,t_off,T,U,cut_U,CNSdy,swtrtdy,OSdy, OScnsr, RPSFTM_cnsr, RPSFTM_OSdy, RPSFTMn_cnsr, RPSFTMn_OSdy)
+  
+  RPSFTM_KM<- nphAlltest3(final$RPSFTM_OSdy, final$RPSFTM_cnsr, final$trt)
+  RPSFTMn_KM<- nphAlltest3(final$RPSFTMn_OSdy, final$RPSFTMn_cnsr, final$trt)
+  
+  RPSFTM_COX<- coxph(Surv(RPSFTM_OSdy,1-RPSFTM_cnsr) ~ trt, data = final)  # if needed added strata after 'trt'
+  RPSFTMn_COX<- coxph(Surv(RPSFTMn_OSdy,1-RPSFTMn_cnsr) ~ trt, data = final) # if needed added strata after 'trt'
+  
+  HR_RPSFTM <- as.matrix(exp(RPSFTM_COX$coefficients))
+  HR_RPSFTM_CI<-as.matrix(exp(confint(RPSFTM_COX)))
+  
+  HR_RPSFTMn <- as.matrix(exp(RPSFTMn_COX$coefficients))
+  HR_RPSFTMn_CI<-as.matrix(exp(confint(RPSFTMn_COX)))
+  
+  rownames(HR_RPSFTM)<-c()
+  rownames(HR_RPSFTM_CI)<-c()
+  rownames(HR_RPSFTMn)<-c()
+  rownames(HR_RPSFTMn_CI)<-c()
+  
+  retval <- list ("HR_RPSFTM"=HR_RPSFTM, 
+                  "HR_RPSFTM_nr"=HR_RPSFTMn, 
+                  "HR_hat"=rpsft_result[1,4], 
+                  "PSI_hat"=rpsft_result[1,3], 
+                  "HR_hat_nr"=rpsft_result_nr[1,4], 
+                  "PSI_hat_nr"=rpsft_result_nr[1,3], 
+                  "KM"=RPSFTM_KM,
+                  "KM_nr"=RPSFTMn_KM,
+                  "data"=final,
+                  "Pvalue"= data.frame(cbind(psi1,pvalue)),
+                  "Pvalue_nr"=data.frame(cbind(psi1_nr,pvalue_nr)))
+  return(retval)
+}
+
+
+rpsftm_result<-rpsftmfit(os_data_itt, -1,1,0.01)
+
+#construct the 95%CI by using boostrapping
+
+addTaskCallback(function(...) {set.seed(123456);TRUE})
+summary.rpsftm.boostrap.out<-NULL
+
+for (i in 1:1000) {
+  os_data_rpsftm_c<-os_data_itt%>%filter(trt==0)
+  os_data_rpsftm_t<-os_data_itt%>%filter(trt==1)
+  nc<-nrow(os_data_rpsftm_c)
+  nt<-nrow(os_data_rpsftm_t)
+  os_data_rpsftm_bootstrap_c<-dplyr::sample_n(os_data_rpsftm_c, nc, replace=TRUE)
+  os_data_rpsftm_bootstrap_t<-dplyr::sample_n(os_data_rpsftm_t, nt, replace=TRUE)
+  os_data_rpsftm_bootstrap<-rbind(os_data_rpsftm_bootstrap_c,  os_data_rpsftm_bootstrap_t)
+  resut_rpsftm_bootstrap_temp<-rpsftmfit(os_data_rpsftm_bootstrap, -1, 1, 0.01)
+  out.bootstrap_temp<-c(resut_rpsftm_bootstrap_temp$HR_RPSFTM,
+                        resut_rpsftm_bootstrap_temp$HR_RPSFTM_nr,
+                        resut_rpsftm_bootstrap_temp$PSI_hat,
+                        resut_rpsftm_bootstrap_temp$PSI_hat_nr)
+  summary.rpsftm.boostrap.out<-rbind(out.bootstrap_temp, summary.rpsftm.boostrap.out)
+}  
+
+summary.rpsftm.boostrap.out
+rpsftm_hr_ci<-quantile(summary.rpsftm.boostrap.out[,1], probs=c(0.025, 0.975))
+rpsftm_hr_ci_nr<-quantile(summary.rpsftm.boostrap.out[,2], probs=c(0.025, 0.975))
+rpsftm_psi_ci<-quantile(summary.rpsftm.boostrap.out[,3], probs=c(0.025, 0.975))
+rpsftm_psi_nr<-quantile(summary.rpsftm.boostrap.out[,4], probs=c(0.025, 0.975))
+rpsftm_hr_ci
+rpsftm_hr_ci_nr
+rpsftm_psi_ci
+rpsftm_psi_nr
+removeTaskCallback(1)
+
+
+#plot the result
+km_est_itt <- survfit(Surv(OSdy, 1-OScnsr ) ~ treatment, data = os_data_itt)
+km_est_rpsftm <- survfit(Surv(RPSFTM_OSdy, 1-RPSFTM_cnsr ) ~ treatment, data = rpsftm_result$data)
+km_est_rpsftm_nr <- survfit(Surv(RPSFTMn_OSdy, 1-RPSFTMn_cnsr ) ~ treatment, data = rpsftm_result$data)
+
+km_df_itt = tibble(time = km_est_itt$time, 
+                   surv = km_est_itt$surv, 
+                   trt = c(rep("control.itt",250), rep("treatment", 250)), 
+                   censor = (km_est_itt$n.event == 0))
+
+km_df_rpsftm = tibble(time = km_est_rpsftm$time, 
+                  surv = km_est_rpsftm$surv, 
+                  trt = c(rep("control.rpsftm",250), rep("treatment", 250)), 
+                  censor = (km_est_rpsftm$n.event == 0))
+km_df_rpsftm.c=km_df_rpsftm%>%filter(trt=="control.rpsftm")
+
+km_df_rpsftm_nr = tibble(time = km_est_rpsftm_nr$time, 
+                     surv = km_est_rpsftm_nr$surv, 
+                     trt = c(rep("control.rpsftm.nr",250), rep("treatment", 250)), 
+                     censor = (km_est_rpsftm_nr$n.event == 0))
+km_df_rpsftm_nr.c=km_df_rpsftm_nr%>%filter(trt=="control.rpsftm.nr")
+
+km_df_com = rbind(km_df_itt, km_df_rpsftm.c, km_df_rpsftm_nr.c)
+
+fig_gg_rpsftm <- ggplot(km_df_com, aes(x = time, y = surv, 
+                                group = trt, 
+                                color = trt)) + 
+  
+  geom_step() + 
+  scale_x_continuous("Months after randomization", 
+                     breaks = seq(0,60,10)) + 
+  scale_y_continuous("Survival", 
+                     breaks = seq(0,1,0.2)) + 
+  theme(legend.title = element_blank())
+
+fig_gg_rpsftm
+
+##############################################################################################################################################################
+
+# Example of deming conference for Two-Stage 
+
+os_data_ts<-read.csv("/mnt/usrfiles/bgcrh/biostat/songzil/2022 Deming Conference/TS_Example_Data.csv")
+
+nphAlltest3 <-       # log-rank only
+  function (survival, cnsr, trt) 
+  {
+    fit <- survfit(Surv(survival, 1-cnsr) ~ trt)
+    lr <- unlist(test.lr(survival, cnsr, trt))
+    lr.ci <- exp(c(log(lr[3]) - qnorm(0.975) * lr[4], log(lr[3]) + 
+                     qnorm(0.975) * lr[4]))
+    stat1 <- data.frame(Test = "Log-Rank", t(c(lr[c(1, 3)], lr.ci)), t(summary(fit)$table[,7]))
+    return(stat1)
+  }
+
+#implement the simple two-stage method
+#function of two-stage method
+
+TwoStageWeibull<- function(data) {
+  
+  # get the control arm patients with PD
+  Progdata<-data%>%filter(trt==0 & TTPcnsr==0)%>%mutate(SPP2Stage= OSdy-TTPdy)
+  
+  # fit the AFT model (dist= weibull) to estimate the swtrt effect
+  TwoStagefit<-survreg(formula = Surv(SPP2Stage, 1-OScnsr)~ swtrt + cov + strata , data=Progdata, dist='weibull') # adjust the covariate and strata if needed
+  
+  effect<-exp(TwoStagefit$coefficients[2])
+  
+  Twostagedata<-data%>% mutate(t_on= OSdy*trt + (1-trt)*(1-TTPcnsr)*swtrt*(OSdy - TTPdy) +(1-trt)*TTPcnsr*swtrt*(OSdy - swtrtdy), #observed time of active (also account patients without radiological PD but recevied anti-cancer therapy) 
+                               t_off= (1-trt)*(1-TTPcnsr)*swtrt*TTPdy + (1-trt)*(1-TTPcnsr)*(1-swtrt)*OSdy + (1-trt)*TTPcnsr*swtrt*swtrtdy + (1-trt)*TTPcnsr*(1-swtrt)*OSdy, #observed time of control
+                               T=t_on+t_off,
+                               U=t_off + t_on/effect, #counterfactual event time without treatment effect
+                               temp_CNSdy=CNSdy/effect,
+                               cut_U= ifelse(CNSdy<=temp_CNSdy,CNSdy,temp_CNSdy),
+                               effect_OSdy = (1-trt)*swtrt*U+(1-trt)*(1-swtrt)*OSdy+trt*OSdy,
+                               
+                               #with re-censoring
+                               TwoS_OSdy = (1-OScnsr)*(1-trt)*swtrt*ifelse(effect_OSdy<=cut_U,effect_OSdy, cut_U) + OScnsr*(1-trt)*swtrt*cut_U +(1-trt)*(1-swtrt)*OSdy + trt*OSdy,
+                               TwoS_cnsr=(1-OScnsr)*(1-trt)*swtrt*ifelse(effect_OSdy<=cut_U,0,1)+ OScnsr,
+                               
+                               #without re-censoring
+                               TwoS_OSdy_n = effect_OSdy,
+                               TwoS_cnsr_n= OScnsr)%>%
+    
+    dplyr::select(enterT,treatment,trt,swtrt,t_on,t_off,T,U,CNSdy, TTPdy, OSdy, cut_U, effect_OSdy, TwoS_OSdy, TwoS_cnsr, TwoS_OSdy_n, TwoS_cnsr_n, OScnsr, TTPcnsr) # if want to add strata variable, then add needed variable after TTPcnsr
+  
+  TwoStage_KM<- nphAlltest3(Twostagedata$TwoS_OSdy,   Twostagedata$TwoS_cnsr, Twostagedata$trt)   # adjust the covariate and strata if needed
+  TwoStage_COX<-coxph(Surv(TwoS_OSdy,1- TwoS_cnsr) ~ trt , data = Twostagedata) # adjust the covariate and strata if needed
+  
+  TwoStage_KM_n<-nphAlltest3(  Twostagedata$TwoS_OSdy_n,   Twostagedata$TwoS_cnsr_n, Twostagedata$trt)  # adjust the covariate and strata if needed
+  TwoStage_COX_n<-coxph(Surv(TwoS_OSdy_n, 1-TwoS_cnsr_n) ~ trt, data = Twostagedata) # adjust the covariate and strata if needed
+  
+  HR_TwoStage <- as.matrix(exp(TwoStage_COX$coefficients))
+  HR_TwoStage_CI <- as.matrix(exp(confint(TwoStage_COX)))
+  
+  HR_TwoStage_n <- as.matrix(exp(TwoStage_COX_n$coefficients))
+  HR_TwoStage_CI_n <- as.matrix(exp(confint(TwoStage_COX_n)))
+  
+  rownames(HR_TwoStage)<-c()
+  rownames(HR_TwoStage_CI)<-c()
+  retval <- list ("KM"=TwoStage_KM,
+                  "KM_nr"=TwoStage_KM_n,
+                  "HR_TwoStage"=HR_TwoStage,
+                  "HR_TwoStage_nr"=HR_TwoStage_n,
+                  "Swtrt_effect"=TwoStagefit$coefficients[2], 
+                  "data"=Twostagedata)
+  return(retval)   
+}
+
+result_ts<-TwoStageWeibull(os_data_ts)
+
+#construct the 95%CI by using boostrapping
+
+addTaskCallback(function(...) {set.seed(123456);TRUE})
+summary.ts.boostrap.out<-NULL
+
+for (i in 1:1000) {
+  os_data_ts_c<-os_data_ts%>%filter(trt==0)
+  os_data_ts_t<-os_data_ts%>%filter(trt==1)
+  nc<-nrow(os_data_ts_c)
+  nt<-nrow(os_data_ts_t)
+  os_data_ts_bootstrap_c<-dplyr::sample_n(os_data_ts_c, nc, replace=TRUE)
+  os_data_ts_bootstrap_t<-dplyr::sample_n(os_data_ts_t, nt, replace=TRUE)
+  os_data_ts_bootstrap<-rbind(os_data_ts_bootstrap_c,  os_data_ts_bootstrap_t)
+  resut_ts_bootstrap_temp<-TwoStageWeibull(os_data_ts_bootstrap)
+  out.bootstrap_temp<-c(resut_ts_bootstrap_temp$HR_TwoStage, resut_ts_bootstrap_temp$HR_TwoStage_nr)
+  summary.ts.boostrap.out<-rbind(out.bootstrap_temp, summary.ts.boostrap.out)
+}  
+
+summary.ts.boostrap.out
+ts_ci<-quantile(summary.ts.boostrap.out[,1], probs=c(0.025, 0.975))
+ts_ci_nr<-quantile(summary.ts.boostrap.out[,2], probs=c(0.025, 0.975))
+ts_ci
+ts_ci_nr
+
+removeTaskCallback(1)
+
+#plot the result: compare between True model, ITT, and Two-Stage with/without re-censoring
+km_est_itt <- survfit(Surv(OSdy, 1-OScnsr ) ~ treatment, data = os_data_ts)
+km_est_ts <- survfit(Surv(TwoS_OSdy, 1-TwoS_cnsr ) ~ treatment, data = result_ts$data)
+km_est_ts_nr <- survfit(Surv(TwoS_OSdy_n, 1-TwoS_cnsr_n ) ~ treatment, data = result_ts$data)
+
+km_df_itt = tibble(time = km_est_itt$time, 
+                   surv = km_est_itt$surv, 
+                   trt = c(rep("control.itt",250), rep("treatment", 250)), 
+                   censor = (km_est_itt$n.event == 0))
+
+km_df_ts = tibble(time = km_est_ts$time, 
+                  surv = km_est_ts$surv, 
+                  trt = c(rep("control.ts",250), rep("treatment", 250)), 
+                  censor = (km_est_ts$n.event == 0))
+km_df_ts.c=km_df_ts%>%filter(trt=="control.ts")
+
+km_df_ts_nr = tibble(time = km_est_ts_nr$time, 
+                     surv = km_est_ts_nr$surv, 
+                     trt = c(rep("control.ts.nr",250), rep("treatment", 250)), 
+                     censor = (km_est_ts_nr$n.event == 0))
+km_df_ts_nr.c=km_df_ts_nr%>%filter(trt=="control.ts.nr")
+
+km_df_com = rbind(km_df_itt, km_df_ts.c, km_df_ts_nr.c)
+
+
+
+fig_gg_ts <- ggplot(km_df_com, aes(x = time, y = surv, 
+                                group = trt, 
+                                color = trt)) + 
+  
+  geom_step() + 
+  scale_x_continuous("Months after randomization", 
+                     breaks = seq(0,60,10)) + 
+  scale_y_continuous("Survival", 
+                     breaks = seq(0,1,0.2)) + 
+  theme(legend.title = element_blank())
+
+fig_gg_ts
+
+#####################################################################################################################
+
+# Example of deming conference for IPCW 
+
+
+#function 'ipwplot'
+
+ipwplot <- function(weights, timevar = NULL, binwidth = NULL, logscale = TRUE, xlab = NULL, ylab = NULL, main = "", ref = TRUE, ...){
+  if (!is.null(timevar)){
+    timevargrp <- round(timevar/binwidth)*binwidth
+    if (is.null(xlab)) xlab <- deparse(match.call()$timevar, width.cutoff = 500)
+    if (is.null(ylab) & logscale == FALSE) ylab <- deparse(match.call()$weights, width.cutoff = 500)
+    if (is.null(ylab) & logscale == TRUE) ylab <- paste("log(", deparse(match.call()$weights, width.cutoff = 500), ")", sep = "")
+    if(logscale == TRUE){
+      boxplot(log(weights) ~ timevargrp, pch = 20, xlab = xlab, ylab = ylab, main = main, ...)
+      if (ref == TRUE) abline(h = log(1), lty = 2)
+    }
+    if(logscale == FALSE){
+      boxplot(weights ~ timevargrp, pch = 20, xlab = xlab, ylab = ylab, main = main, ...)
+      if (ref == TRUE) abline(h = 1, lty = 2)
+    }
+  }
+  if (is.null(timevar)){
+    if (is.null(xlab) & logscale == FALSE) xlab <- deparse(match.call()$weights, width.cutoff = 500)
+    if (is.null(xlab) & logscale == TRUE) xlab <- paste("log(", deparse(match.call()$weights, width.cutoff = 500), ")", sep = "")
+    if (is.null(ylab)) ylab <- "density"
+    if(logscale == TRUE){
+      plot(density(log(weights)), pch = 20, xlab = xlab, ylab = ylab, main = main, ...)
+      if (ref == TRUE) abline(v = log(1), lty = 2)
+    }
+    if(logscale == FALSE){
+      plot(density(weights), pch = 20, xlab = xlab, ylab = ylab, main = main, ...)
+      if (ref == TRUE) abline(v = 1, lty = 2)
+    }
+  }
+}
+
+# We start with data handling in the ipcwswitch package
+# To obtain the times parameter, we can apply the timesTokeep function on the same
+# dataframe in the wide format
+# names of the repeated measurements
+vect.ps   <- c("myps.v2", "ps.v3", c(paste("ps1.v", seq(1,21), sep="")))
+vect.ttc  <- c("myttc.v2", "ttc.v3", c(paste("ttc1.v", seq(1,21), sep="")))
+vect.tran <- c("mytran.v1", paste("tran.v", seq(2,21), sep=""))
+# corresponding dates
+dates <- c("dexac.v2", "dexac.v3", c(paste("dexac1.v", seq(21), sep="")))
+dates2 <- dates[!(dates %in% c("dexac.v2","dexac.v3"))]
+
+# times to keep
+kept.t <- timesTokeep(SHIdat, id = "id",
+                      tstart = "dexac.v2", tstop = "ddn",
+                      mes.cov = list(vect.ps, vect.ttc, vect.tran),
+                      time.cov = list(dates, dates, dates2))
+# Now, we can build the long format
+shilong <- wideToLongTDC(SHIdat, id = "id",
+                         tstart = "dexac.v2", tstop = "ddn",
+                         event = "status",
+                         bas.cov = c("agerand", "sex.f","tt_Lnum", "rmh_alea.c", "pathway.f",
+                                     "bras.f","debttCO","ddt.v1", "ddn","progDate"),
+                         mes.cov = list(f1=vect.ps, f2=vect.ttc, f3=vect.tran),
+                         time.cov = list(dates, dates, dates2),
+                         times = kept.t[[1]])
+
+# Put dates in numeric format with tstart at 0
+tabi <- split(shilong, shilong$id)
+L.tabi   <- length(tabi)
+tablist <- lapply(1:L.tabi, function(i){
+  refstart <- tabi[[i]]$tstart[1]
+  
+  tabi[[i]]$tstart  <- as.numeric(tabi[[i]]$tstart - refstart)
+  tabi[[i]]$tstop <- as.numeric(tabi[[i]]$tstop - refstart)
+  tabi[[i]]$dpd <- as.numeric(tabi[[i]]$progDate - refstart)
+  tabi[[i]]$dco <- as.numeric(tabi[[i]]$debttCO - refstart)
+  tabi[[i]]$ady <- as.numeric(tabi[[i]]$ddn - refstart)
+  
+  return(tabi[[i]])
+})
+shilong <- do.call( rbind, tablist )
+
+# Eliminating patient not having initiated the treatment arm
+shilong <- shilong[!is.na(shilong$ddt.v1),]
+
+colnames(shilong)[15:17] <- c("ps", "ttc", "tran")
+shilong <- shilong %>% dplyr::select(-c(ddt.v1, debttCO, ddn, progDate))
+shilong <- tibble(shilong)
+head(shilong)
+
+# one patient one record for PD & CO summary
+test <- shilong %>% group_by(id) %>% filter(row_number() == n()) %>% 
+  mutate(co = !is.na(dco), pd = !is.na(dpd))
+
+# summarize pd and death status by treatment and switch status
+test %>% group_by(bras.f, co) %>% 
+  summarize(death_no_pd = sum(event & !pd), 
+            pd_no_death = sum(pd & !event),
+            pd_then_death = sum(pd & event),
+            no_pd_no_death = sum(!pd & !event))
+
+test %>% filter(co & pd) %>% group_by(bras.f) %>% 
+  summarise(pd_before_co = sum(dpd <= dco), 
+            co_before_pd = sum(dco < dpd))
+
+# Patients are censored when initiating the other arm treatment
+shilong2 <- shilong %>% 
+  filter(is.na(dco) | tstart < dco) %>% 
+  group_by(id) %>% 
+  mutate(event = ifelse(!is.na(dco) & row_number() == n() & 
+                          tstop > dco, 0, event), 
+         tstop = ifelse(!is.na(dco) & row_number() == n() & 
+                          tstop > dco, dco, tstop), 
+         cens = ifelse(row_number() == n(), 1 - event, 0), 
+         cross = ifelse(row_number() == n() & !is.na(dco) & 
+                          ady > dco, 1, 0))
+
+
+
+# replicate event times within each subject
+times <- unique(shilong2$tstop[shilong2$event == 1])
+df <- survSplit(shilong2, cut=times, end="tstop", event="event")
+d1 <- survSplit(shilong2, cut=times, end="tstop", event="cens")
+d2 <- survSplit(shilong2, cut=times, end="tstop", event="cross")
+df$cens <- d1$cens
+df$cross <- d2$cross
+df$bras.f <- relevel(df$bras.f, ref="CT")
+df <- tibble(df)
+head(df, 10)
+
+
+# models for censoring due to treatment crossover
+tab <- split(df, df$bras.f)
+tablist <- lapply(1:length(tab), function(i) {
+  df1 <- tab[[i]]  
+  # denominator considering baseline & time-dependent covariates
+  fit.den <- coxph(Surv(tstart, tstop, cross) ~ agerand + 
+                     sex.f + tt_Lnum + rmh_alea.c + 
+                     pathway.f + ps + ttc + tran, data = df1)
+  km.den <- survfit(fit.den, newdata = df1, id = id)  
+  # numerator considering baseline covariates
+  fit.num <- coxph(Surv(tstart, tstop, cross) ~ agerand + 
+                     sex.f + tt_Lnum + rmh_alea.c + 
+                     pathway.f, data = df1)
+  km.num <- survfit(fit.num, newdata = df1, id = id)
+  # merge denominator and numerator
+  tibble(id = as.numeric(rep(attr(km.den$strata, "names"), 
+                             km.den$strata)), 
+         tstop = km.den$time, 
+         surv.den = km.den$surv, surv.num = km.num$surv)
+})
+df.model <- do.call(rbind, tablist)
+df.w <- df %>% left_join(df.model, by = c("id", "tstop")) %>% 
+  mutate(sw = surv.num/surv.den)
+
+
+# numerator model for censoring ignoring covariates
+tab <- split(df, df$bras.f)
+tablist <- lapply(1:length(tab), function(i) {
+  df1 <- tab[[i]]
+  fit1 <- coxph(Surv(tstart, tstop, cross) ~ 1, data = df1)
+  km1 <- survfit(fit1)
+  
+  df2 <- tibble(tstop = km1$time, surv.num2 = km1$surv)
+  df1 %>% left_join(df2, by=c("tstop")) %>% 
+   dplyr::select(id, tstop, surv.num2)
+})
+df.num2 <- do.call(rbind, tablist)
+dfs <- df.w %>% left_join(df.num2, by = c("id", "tstop")) %>% 
+  mutate(sw2 = surv.num2/surv.den)
+
+
+ipwplot(weights = dfs$sw, timevar = dfs$tstop, 
+        binwidth = 50, logscale = FALSE, 
+        xlab = "Days after randomization", 
+        ylab = "Stabilized weights")
+
+# Cox regression with stabilized weights 
+(fit2 <- coxph(Surv(tstart, tstop, event) ~ bras.f + agerand + 
+                 sex.f + tt_Lnum + rmh_alea.c + pathway.f, 
+               data = dfs, weights = sw, id = id))
+# 95% CI for hazard ratios
+exp(confint(fit2))
+
+# IPCW log-rank test with stabilized weights 
+fit_lr <- coxph(Surv(tstart, tstop, event) ~ bras.f, 
+                data = dfs, weights = sw2, id = id)
+summary(fit_lr)
+
+# IPCW KM estimates
+km_est <- survfit(Surv(tstart, tstop, event) ~ bras.f, 
+                  data = dfs, weights = sw2, id = id, 
+                  type = "fleming-harrington")
+plot(km_est, xlab = "Days after randomization", 
+     ylab = "Survival", col = c("red", "blue"))
+text(x = c(400, 400), y = c(0.6, 0.15), 
+     labels = c("CT", "MTA"), pos = 4)
